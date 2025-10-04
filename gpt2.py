@@ -130,8 +130,8 @@ class GPT2(nn.Module):
         self.device = device or DeviceRef.CPU()
         self.n_ctx = n_ctx
         self.dtype = dtype
-        self.wte = nn.Embedding(vocab_size, n_embd, dtype, device=DeviceRef.CPU())
-        self.wpe = nn.Embedding(n_ctx, n_embd, dtype, DeviceRef.CPU())
+        self.wte = nn.Embedding(vocab_size, n_embd, dtype, device=self.device)
+        self.wpe = nn.Embedding(n_ctx, n_embd, dtype, device=self.device)
         self.h = LayerList(
             [
                 GPT2Block(n_head, n_embd, layer_norm_epsilon, self.device, dtype)
@@ -144,16 +144,15 @@ class GPT2(nn.Module):
         self.lm_head.weight = self.wte.weight
 
     def __call__(self, token_ids: TensorValue) -> TensorValue:
-        B, T = [int(d) for d in token_ids.shape]
-        assert T <= self.n_ctx, f"Input sequence of length {T} too long"
-        pos = ops.range(0, T, dtype=DType.int64, device=DeviceRef.CPU())
+        B, T = token_ids.shape
+        pos = ops.range(0, T, out_dim=T, dtype=DType.int64, device=self.device)
 
         token_embd = self.wte(token_ids)  # (B, T, n_embd)
         pos_embd = self.wpe(pos)
-        x = (token_embd + pos_embd).to(self.device)
+        x = token_embd + pos_embd
         for layer in self.h:
             x = layer(x)
         x = self.ln_f(x)
 
         logits = self.lm_head(x[:, -1, :])
-        return logits.to(DeviceRef.CPU())
+        return logits

@@ -1,5 +1,6 @@
 from max.graph.weights import WeightsFormat
 from max.interfaces import PipelineTask
+from max.nn.kv_cache import KVCacheStrategy
 from max.pipelines.lib import (
     SupportedArchitecture,
     SupportedEncoding,
@@ -15,7 +16,7 @@ gpt2_arch = SupportedArchitecture(
     example_repo_ids=["openai-community/gpt2"],
     default_weights_format=WeightsFormat.safetensors,
     default_encoding=SupportedEncoding.float32,
-    supported_encodings={SupportedEncoding.float32: []},
+    supported_encodings={SupportedEncoding.float32: [KVCacheStrategy.PAGED]},
     pipeline_model=GPT2Model,
     tokenizer=TextTokenizer,
     weight_adapters={WeightsFormat.safetensors: convert_safetensor_state_dict},
