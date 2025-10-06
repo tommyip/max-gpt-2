@@ -19,5 +19,4 @@ def convert_safetensor_state_dict(
             np_array = np.from_dlpack(value.data)
             new_state_dict[key] = np.ascontiguousarray(np_array.transpose())
 
-    new_state_dict["lm_head.weight"] = new_state_dict["wte.weight"]
     return new_state_dict

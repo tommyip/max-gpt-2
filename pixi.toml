@@ -9,4 +9,3 @@ version = "0.1.0"
 
 [dependencies]
 modular = ">=25.7.0.dev2025092905,<26"
-safetensors = ">=0.6.2,<0.7"

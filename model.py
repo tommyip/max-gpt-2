@@ -1,36 +1,36 @@
 from dataclasses import dataclass
-from typing import Any, Sequence, cast, override
+from typing import Sequence, cast, override
 
 import numpy as np
+from max.driver import Device, Tensor
+from max.dtype import DType
 from max.engine.api import InferenceSession, Model
+from max.graph import DeviceRef, Graph, TensorType
+from max.graph.weights import Weights, WeightsAdapter
 from max.nn.kv_cache import (
     KVCacheInputs,
     KVCacheInputsSequence,
     KVCacheParams,
+    PagedCacheValues,
     PagedKVCacheManager,
     estimate_kv_cache_size,
     load_kv_manager,
 )
+from max.nn.transformer import ReturnLogits
+from max.pipelines.core import TextContext
 from max.pipelines.lib import (
-    PipelineModel,
-    PipelineConfig,
-    ModelInputs,
-    ModelOutputs,
-    SupportedEncoding,
     KVCacheConfig,
     KVCacheMixin,
-    MAXModelConfigBase,
     MAXModelConfig,
+    MAXModelConfigBase,
+    ModelInputs,
+    ModelOutputs,
+    PipelineConfig,
+    PipelineModel,
+    SupportedEncoding,
     upper_bounded_default,
 )
-from max.pipelines.core import TextContext
-from max.driver import Device, Tensor
-from max.dtype import DType
-from max.graph import Graph, DeviceRef, TensorType
-from max.graph.weights import Weights, WeightsAdapter
-from max.nn.transformer import ReturnLogits
 from transformers import AutoConfig
-from safetensors import safe_open
 
 from .gpt2 import GPT2
 
@@ -88,15 +88,22 @@ class GPT2Config(MAXModelConfig, GPT2ConfigBase):
 
 class GPT2Inputs(ModelInputs):
     tokens: Tensor
+    """Tensor containing the input token IDs."""
+    pos: Tensor
+    """Tensor containing the token positions for indexing the position embeddings."""
     input_row_offsets: Tensor
+    """Tensor containing the offsets for each row in the ragged input sequence,
+    or the attention mask for the padded input sequence."""
 
     def __init__(
         self,
         tokens: Tensor,
+        pos: Tensor,
         input_row_offsets: Tensor,
         kv_cache_inputs: KVCacheInputs | None = None,
     ):
         self.tokens = tokens
+        self.pos = pos
         self.input_row_offsets = input_row_offsets
         self.kv_cache_inputs = kv_cache_inputs
 
@@ -129,10 +136,95 @@ class GPT2Model(PipelineModel[TextContext], KVCacheMixin):
         self.devices = devices
         self.model = self.load_model(session)
 
+    @override
+    def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
+        assert isinstance(model_inputs, GPT2Inputs)
+
+        curr_kv_cache_inputs = model_inputs.kv_cache_inputs or ()
+
+        model_outputs = self.model.execute(
+            model_inputs.tokens,
+            model_inputs.pos,
+            model_inputs.input_row_offsets,
+            *curr_kv_cache_inputs,
+        )
+
+        logits = model_outputs[0]
+        assert isinstance(logits, Tensor)
+        return ModelOutputs(logits=logits)
+
+    @override
+    def prepare_initial_token_inputs(
+        self,
+        context_batch: Sequence[TextContext],
+        kv_cache_inputs: KVCacheInputs | None = None,
+        return_n_logits: int = 1,
+    ) -> ModelInputs:
+        assert kv_cache_inputs is not None
+        kv_cache_inputs = cast(KVCacheInputsSequence, kv_cache_inputs)
+
+        tokens_np = np.concatenate([ctx.next_tokens for ctx in context_batch])
+        tokens = Tensor.from_numpy(tokens_np).to(self.devices[0])
+
+        self.batch_seq_len = np.array([ctx.current_length for ctx in context_batch])
+        batch_token_offsets = np.concatenate(
+            [np.arange(ctx.active_length, dtype=np.int64) for ctx in context_batch]
+        )
+        batch_start_offsets = np.repeat(
+            [ctx.start_idx for ctx in context_batch],
+            [ctx.active_length for ctx in context_batch],
+        )
+        pos_np = batch_start_offsets + batch_token_offsets
+        pos = Tensor.from_numpy(pos_np).to(self.devices[0])
+
+        input_row_offsets_np = np.cumsum(
+            [0] + [ctx.active_length for ctx in context_batch], dtype=np.uint32
+        )
+        input_row_offsets = Tensor.from_numpy(input_row_offsets_np).to(self.devices[0])
+
+        return GPT2Inputs(
+            tokens=tokens,
+            pos=pos,
+            input_row_offsets=input_row_offsets,
+            kv_cache_inputs=kv_cache_inputs,
+        )
+
+    @override
+    def prepare_next_token_inputs(
+        self, next_tokens: Tensor, prev_model_inputs: ModelInputs
+    ) -> ModelInputs:
+        assert isinstance(prev_model_inputs, GPT2Inputs)
+
+        next_offsets_size = prev_model_inputs.input_row_offsets.shape[0]
+        next_row_offsets = self._input_row_offsets_prealloc[:next_offsets_size]
+
+        self.batch_seq_len += 1
+        pos = Tensor.from_numpy(self.batch_seq_len).to(self.devices[0])
+
+        return GPT2Inputs(
+            tokens=next_tokens,
+            pos=pos,
+            input_row_offsets=next_row_offsets,
+            kv_cache_inputs=prev_model_inputs.kv_cache_inputs,
+        )
+
+    def graph_inputs(self) -> Sequence[TensorType]:
+        device_ref = DeviceRef.from_device(self.devices[0])
+
+        kv_inputs = self.kv_manager.input_symbols()
+        tokens_type = TensorType(
+            DType.int64, shape=["total_seq_len"], device=device_ref
+        )
+        pos_type = TensorType(DType.int64, shape=["total_seq_len"], device=device_ref)
+        input_row_offsets_type = TensorType(
+            DType.uint32, shape=["input_row_offsets_len"], device=device_ref
+        )
+        return (tokens_type, pos_type, input_row_offsets_type, *kv_inputs[0])
+
     def load_model(self, session: InferenceSession) -> Model:
         max_batch_size = self.pipeline_config.max_batch_size
         assert max_batch_size
-        self._input_row_offsets = Tensor.from_numpy(
+        self._input_row_offsets_prealloc = Tensor.from_numpy(
             np.arange(max_batch_size + 1, dtype=np.uint32)
         ).to(self.devices[0])
 
@@ -143,8 +235,16 @@ class GPT2Model(PipelineModel[TextContext], KVCacheMixin):
             pipeline_config=self.pipeline_config,
         )
         self.config = config = GPT2Config.generate(self.huggingface_config)
-        device_spec = self.pipeline_config.model_config.device_specs[0]
-        device = DeviceRef(device_spec.device_type, device_spec.id)
+        device_ref = DeviceRef.from_device(self.devices[0])
+        kv_params = GPT2Config.get_kv_params(
+            self.huggingface_config,
+            n_devices=len(self.devices),
+            kv_cache_config=self.kv_cache_config,
+            cache_dtype=self.dtype,
+        )
+
+        graph_inputs = self.graph_inputs()
+
         model_spec = GPT2(
             n_ctx=config.n_ctx,
             vocab_size=config.vocab_size,
@@ -152,16 +252,23 @@ class GPT2Model(PipelineModel[TextContext], KVCacheMixin):
             n_head=config.n_head,
             n_embd=config.n_embd,
             layer_norm_epsilon=config.layer_norm_epsilon,
+            kv_params=kv_params,
             dtype=DType.float32,
-            device=device,
+            device=device_ref,
         )
         model_spec.load_state_dict(state_dict, weight_alignment=1)
-        input_type = TensorType(
-            DType.int64, shape=["batch_size", "total_seq_len"], device=device
-        )
-        with Graph("gpt2", input_types=(input_type,)) as graph:
-            token_ids = graph.inputs[0]
-            output = model_spec(token_ids)
+
+        with Graph("gpt2", input_types=graph_inputs) as graph:
+            tokens, pos, input_row_offsets, *kv_cache_inputs = graph.inputs
+            kv_collection = PagedCacheValues(
+                kv_blocks=kv_cache_inputs[0].buffer,
+                cache_lengths=kv_cache_inputs[1].tensor,
+                lookup_table=kv_cache_inputs[2].tensor,
+                max_lengths=kv_cache_inputs[3].tensor,
+            )
+            output = model_spec(
+                tokens.tensor, pos.tensor, kv_collection, input_row_offsets.tensor
+            )
             graph.output(output)
 
         model = session.load(graph, weights_registry=state_dict)
@@ -184,70 +291,6 @@ class GPT2Model(PipelineModel[TextContext], KVCacheMixin):
                 f"max_length ({pipeline_config.max_length}) exceeds the "
                 f"model's max_seq_len ({huggingface_config.max_seq_len})."
             ) from e
-
-    @override
-    def execute(self, model_inputs: ModelInputs) -> ModelOutputs:
-        assert isinstance(model_inputs, GPT2Inputs)
-
-        (logits,) = self.model.execute(model_inputs.tokens)
-
-        assert isinstance(logits, Tensor)
-        return ModelOutputs(logits=logits)
-
-    @override
-    def prepare_initial_token_inputs(
-        self,
-        context_batch: Sequence[TextContext],
-        kv_cache_inputs: KVCacheInputs | None = None,
-        return_n_logits: int = 1,
-    ) -> ModelInputs:
-        assert kv_cache_inputs is not None
-        kv_cache_inputs = cast(KVCacheInputsSequence, kv_cache_inputs)
-
-        input_row_offsets_np = np.cumsum(
-            [0] + [ctx.active_length for ctx in context_batch], dtype=np.uint32
-        )
-        input_row_offsets = Tensor.from_numpy(input_row_offsets_np).to(self.devices[0])
-
-        tokens_np = np.stack([ctx.next_tokens for ctx in context_batch])
-        tokens = Tensor.from_numpy(tokens_np).to(self.devices[0])
-
-        print(
-            f"prepare_initial_token_inputs tokens={tokens_np} input_row_offsets={input_row_offsets_np}"
-        )
-
-        return GPT2Inputs(
-            tokens=tokens,
-            input_row_offsets=input_row_offsets,
-            kv_cache_inputs=kv_cache_inputs,
-        )
-
-    @override
-    def prepare_next_token_inputs(
-        self, next_tokens: Tensor, prev_model_inputs: ModelInputs
-    ) -> ModelInputs:
-        assert isinstance(prev_model_inputs, GPT2Inputs)
-        prev_tokens = prev_model_inputs.tokens.to_numpy()
-        tokens_np = np.hstack(
-            [prev_tokens, np.expand_dims(next_tokens.to_numpy(), axis=1)]
-        )
-        tokens = Tensor.from_numpy(tokens_np).to(self.devices[0])
-
-        # row_offsets_size = prev_model_inputs.input_row_offsets.shape[0]
-        # next_row_offsets = self._input_row_offsets[:row_offsets_size]
-        seq_lengths = [tokens_np.shape[1]] * tokens_np.shape[0]
-        next_row_offsets_np = np.cumsum([0] + seq_lengths, dtype=np.uint32)
-        next_row_offsets = Tensor.from_numpy(next_row_offsets_np).to(self.devices[0])
-
-        print(
-            f"prepare_next_token_inputs tokens={tokens_np} input_row_offsets={next_row_offsets.to_numpy()}"
-        )
-
-        return GPT2Inputs(
-            tokens=tokens,
-            input_row_offsets=next_row_offsets,
-            kv_cache_inputs=prev_model_inputs.kv_cache_inputs,
-        )
 
     @override
     def load_kv_manager(
@@ -312,68 +355,3 @@ class GPT2Model(PipelineModel[TextContext], KVCacheMixin):
             available_cache_memory=available_cache_memory,
             devices=devices,
         )
-
-
-def convert_state_dict(state_dict: dict[str, Any]):
-    for key, tensor in list(state_dict.items()):
-        if (
-            key.endswith("c_attn.weight")
-            or key.endswith("c_proj.weight")
-            or key.endswith("c_fc.weight")
-        ):
-            state_dict[key] = np.ascontiguousarray(tensor.transpose())
-        if key.endswith(".attn.bias"):
-            del state_dict[key]
-    state_dict["lm_head.weight"] = state_dict["wte.weight"]
-    return state_dict
-
-
-if __name__ == "__main__":
-    import numpy as np
-    from max.engine.api import InferenceSession
-    from max.driver import Accelerator, Tensor, CPU
-    from max.dtype import DType
-    from max.graph import DeviceRef, Graph, TensorType, ops
-
-    np.random.seed(0)
-
-    device_ref = DeviceRef.GPU()
-    device = Accelerator()
-
-    with safe_open(
-        "/home/thomas/.cache/huggingface/hub/models--openai-community--gpt2/snapshots/607a30d783dfa663caf39e06633721c8d4cfcd7e/model.safetensors",
-        framework="numpy",
-    ) as f:
-        weights = {k: f.get_tensor(k) for k in f.keys()}
-        state_dict = convert_state_dict(weights)
-
-    gpt2 = GPT2(
-        n_ctx=1024,
-        vocab_size=50257,
-        n_layer=12,
-        n_head=12,
-        n_embd=768,
-        layer_norm_epsilon=1e-5,
-        device=device_ref,
-    )
-    gpt2.load_state_dict(state_dict)
-    input_type = TensorType(dtype=DType.int64, shape=(1, 1000), device=DeviceRef.CPU())
-    with Graph("gpt_2", input_types=(input_type,)) as graph:
-        x = graph.inputs[0]
-        y = gpt2(x)
-        graph.output(y)
-
-    session = InferenceSession(devices=[CPU(), device])
-    model = session.load(graph, weights_registry=state_dict)
-    for tensor in model.input_metadata:
-        print(f"name: {tensor.name}, shape: {tensor.shape}, dtype: {tensor.dtype}")
-    for tensor in model.output_metadata:
-        print(f"out name: {tensor.name}, shape: {tensor.shape}, dtype: {tensor.dtype}")
-
-    x = np.random.randint(0, 50257, size=(1, 1000))
-    x = Tensor.from_numpy(x)
-    print(x.dtype)
-    output = model.execute(x)[0]
-    assert isinstance(output, Tensor)
-    result = output.to_numpy()
-    print(result)
